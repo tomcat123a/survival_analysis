@@ -34,7 +34,7 @@ parser=Parser.parse_args()
 a=surv_experiment()
 
 class surv_experiment():
-    def __init__(self,simu=True,n=100,p=10,realp=30,distribution_type='gaussian',\
+    def __init__(self,simu=True,cancer='BRCA',n=100,p=10,realp=30,distribution_type='gaussian',\
                  time_distribution='weibull',\
                  la=0.8,al=1,miu=2,cencorrate=0.5,sigma=0.2,random_seed=0,\
                  training_percent=0.6,val_percent=0.2,save=False,saveid=1):
@@ -48,20 +48,41 @@ class surv_experiment():
             self.test_x,self.test_y,self.test_c=self.splitdata(self.full_x,\
             self.full_t,self.full_c,\
             training_percent=training_percent,val_percent=val_percent,save=save,saveid=saveid)
-        
-    def generate_x(self,n,p,realp,distribution_type,random_seed ,sigma):
-        generate_model=Fc( encoder_hidden_size=[realp,int(np.sqrt(p)),p], bn=0,dr_p=0)
+        else:
+            self.splitcv(x,t,c,training_percent,nfolds)
+    def generate_x(self,n,p,realp,distribution_type,random_seed ,sigma,case=0):
+        '''case:0 original add extra dimension noise
+           case:1 original linear transformed add extra dimension noise
+           case:2 original nonlinear transformed add nonlinear dimension
+           X core signal 
+           d after adding extra features or transformation
+        '''
         X=np.random.uniform(0,1,n*realp).reshape((n,realp)).astype(np.float32,casting='same_kind')
-        d=generate_model(torch.from_numpy(X)).data.numpy()
+        if case==0:
+            extra_x=np.random.uniform(0,1,n*(p-realp)).reshape((n,(p-realp))).astype(np.float32,casting='same_kind')
+            d=np.concatenate((X,extra_x),axis=0)
+        if case==1:
+            assert p/2==int(p/2)
+            generate_model=Fc( encoder_hidden_size=[realp,p/2], bn=0,dr_p=0)
+            extra_x=np.random.uniform(0,1,n*(p/2)).reshape((n,(p/2))).astype(np.float32,casting='same_kind')
+            X=generate_model(torch.from_numpy(X)).data.numpy()
+            d=np.concatenate((X,extra_x),axis=0)
+        
+        if case==2:
+            
+            generate_model=Fc( encoder_hidden_size=[realp,int(np.sqrt(p/2)),p/2], bn=0,dr_p=0)
+            extra_x=np.random.uniform(0,1,n*(p/2)).reshape((n,(p/2))).astype(np.float32,casting='same_kind')
+            X=generate_model(torch.from_numpy(X)).data.numpy()
+            d=np.concatenate((X,extra_x),axis=0)
         if distribution_type=='gaussian':
             return d+sigma*np.random.normal(0,1,n*p).reshape((n,p)),X
         
         if distribution_type=='uniform':
             return d+sigma*np.random.uniform(0,1,n*p).reshape((n,p)),X
          
-            
+              
     def simulatedata(self,n=10,p=10,realp=30,distribution_type='gaussian',time_distribution='weibull',\
-                     la=0.8,al=1,miu=2,cencorrate=0.5,sigma=0.2,random_seed=0):
+                     la=0.8,al=1,miu=2,cencorrate=0.5,sigma=0.2,random_seed=0,effect_case=0,x_case=0):
         assert time_distribution  in ['weibull','gompez']
         assert la>0 and miu>0
         
@@ -87,15 +108,27 @@ class surv_experiment():
         random_seed=0
         '''
         np.random.seed(random_seed)
-        X,essential_X=self.generate_x(n,p,realp,distribution_type,random_seed=random_seed,sigma=sigma)
+        X,essential_X=self.generate_x(n,p,realp,distribution_type,random_seed=random_seed,sigma=sigma,case=x_case)
         U=np.random.uniform(0.01,0.99, n)
-        true_f=[realp,realp,1]
-        generate_model=Fc(encoder_hidden_size=true_f,bn=0,dr_p=0)
+        if effect_case==0:
+            true_f=[realp,1]
+            generate_model=Fc(encoder_hidden_size=true_f,bn=0,dr_p=0)
+        if effect_case==1:
+            t_func=lambda x:np.sum( np.array([x[0]*x[1],\
+    x[2]*x[3]**2,0.3*np.exp(x[4]),x[5]/(1+abs(x[6]-2*x[7])),\
+    np.exp(-0.25*(x[8]+x[9])**2),-x[0]-x[3],x[2]-2*x[4],x[5]*x[6],x[7]**3,np.cos(x[8]) ]) )
+        if effect_case==2:
+            true_f=[realp,realp,realp,1]
+            generate_model=Fc(encoder_hidden_size=true_f,bn=0,dr_p=0)
          
         timelist=[]
         for i in range(n):
             u=U[i]
-            sample_contrib_term=np.exp(generate_model(torch.from_numpy( essential_X[i]).unsqueeze(0)).cpu().data.numpy()[0] )
+            if case in [0,2]:
+                sample_contrib_term=np.exp(generate_model(torch.from_numpy( essential_X[i]).unsqueeze(0)).cpu().data.numpy()[0] )
+            if case in [1]:
+                sample_contrib_term=np.exp(t_func( essential_X[i]))
+            
             #print(sample_contrib_term)
             if time_distribution=='weibull':
                 #hazard(t|contrib_term)=la*contrib_term*t**(miu-1)
@@ -181,7 +214,7 @@ class surv_experiment():
             pass
         if name in ['xgboost']:
             pass
-        
+        return self.model_out_info
            
     def init_model_list(self):
         pass
@@ -627,7 +660,7 @@ def comparemodel(case=1,features=20,realp=10,samples_n=100,saveid=1):
         p['fc']=marker
         
         print(cidx_result)
-        cidx_result.to_csv('id{}_d_{}_cidx.csv'.format(saveid,features),index=False)
+        cidx_result.to_csv('id_{}_d_{}_cidx.csv'.format(saveid,features),index=False)
         
-        p.to_csv('../simulationdata/id{}_d_{}_marker.csv'.format(saveid,features),index=False)
+        p.to_csv('../simulationdata/id_{}_d_{}_marker.csv'.format(saveid,features),index=False)
 comparemodel(case=1,features=parser.d,saveid=parser.id)        
