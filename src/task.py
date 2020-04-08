@@ -63,7 +63,7 @@ class surv_experiment():
             d=np.concatenate((X,extra_x),axis=0)
         if case==1:
             assert p/2==int(p/2)
-            generate_model=Fc( encoder_hidden_size=[realp,p/2], bn=0,dr_p=0)
+            generate_model=LinearBlock( realp,p/2, bn=0,dr_p=0,no_tail=True,bias=False)
             extra_x=np.random.uniform(0,1,n*(p/2)).reshape((n,(p/2))).astype(np.float32,casting='same_kind')
             X=generate_model(torch.from_numpy(X)).data.numpy()
             d=np.concatenate((X,extra_x),axis=0)
@@ -112,7 +112,7 @@ class surv_experiment():
         U=np.random.uniform(0.01,0.99, n)
         if effect_case==0:
             true_f=[realp,1]
-            generate_model=Fc(encoder_hidden_size=true_f,bn=0,dr_p=0)
+            generate_model=LinearBlock(true_f[0],true_f[1],bn=0,dr_p=0,no_tail=True,bias=False)
         if effect_case==1:
             t_func=lambda x:np.sum( np.array([x[0]*x[1],\
     x[2]*x[3]**2,0.3*np.exp(x[4]),x[5]/(1+abs(x[6]-2*x[7])),\
@@ -178,36 +178,19 @@ class surv_experiment():
         split data into training,val,test
         '''            
                 
-    def test_model(name='as',param_list,epochs=1000,early_stop=False):
+    def test_model(self,name='as',param_list,train_x,train_y,train_c,val_x,val_y,val_c,\
+    epochs=1000):
+        tr_x,tr_t,tr_delta,tr_Rlist=order_make_Rlist(train_x,train_y,train_c)
+        va_x,va_t,va_delta,va_Rlist=order_make_Rlist(val_x,val_y,val_c)
         if name in ['as','fc']:
-            mod_list=self.init_model_list(name,param_list)
-            train_cindex_list=[]
-            for ele in mod_list:
-                if early_stop==False:
-                    converged=self.training_mod(x=train_x, t=train_y,delta=train_c,model=ele,\
-                    lr=0.01,lambda1=ele.lambda1,epoch=epochs,verbose=2,name=name)
-                    loss,cidx,marker=self.predict(x=val_x, t=val_y,delta=val_c,model=ele,verbose=1,name='auto_surv')
-                    if converged==1:
-                        train_cindex_list.append(cidx)
-                        continue
-                    if converged!=1:
-                        print('as not converge')
-                        train_cindex_list.append(cidx)
-                else:
-                    loss_hist=[]
-                    for epo in range(epochs):
-                        self.training_mod(x=train_x, t=train_y,delta=train_c,model=ele,\
-                    lr=0.01,lambda1=ele.lambda1,epoch=epochs,verbose=2,name=name)
-                        loss,cidx,marker=self.predict(x=val_x, t=val_y,delta=val_c,model=ele,verbose=1,name='auto_surv')
-                        loss_hist.append(loss.cpu().data.numpy())
-                        if len(loss_hist)>4:
-                            if loss_hist[-3]<loss_hist[-2] and loss_hist[-2]<loss_hist[-1]:
-                                train_cindex_list.append(cidx)
-                                break
-                        if epo == epochs-1:
-                            print('as not converge')            
-                            train_cindex_list.append(cidx)
-            selected_idx=np.argmax(train_cindex_list)
+            tpe_algo = tpe.suggest
+            tpe_trials = Trials()
+            
+            self.training_mod(tr_x=train_x,tr_Rlist=tr_Rlist,va_x=va_x,va_Rlist=va_Rlist, param=param,\
+                lr=0.002,lambda1=ele.lambda1,epoch=epochs,verbose=2,name=name)
+            tpe_best = fmin(fn=obj, space=space, 
+                            algo=tpe_algo, trials=tpe_trials, 
+                            max_evals=10,rstate=np.random.RandomState(4))
             loss,cidx,marker=self.predict(x=test_x, t=test_y,delta=test_c,model=mod_list[selected_idx],verbose=1,name='auto_surv')
             self.model_out_info[name]={'loss':loss,'cindex':cidx,'marker':marker}
         if name in ['glmnet']:
@@ -218,10 +201,51 @@ class surv_experiment():
            
     def init_model_list(self):
         pass
-                        
-    def training_mod(self):
-        pass
-    
+                
+    def bo_obj_as(self,depth,shrink,lambda1,drop_out):    
+        return self.training_mod(self,tr_x ,tr_Rlist,va_x,va_Rlist,model ,\
+                    lr=0.002,lambda1=lambda1,epoch=epochs,verbose=2,name=name,device=self.device):
+        
+    def bo_obj_fc(self,depth,shrink,lambda1,drop_out):
+        
+    def training_mod(self,param ):
+        lr=self.lr
+        epochs=self.max_epochs
+        verbose=self.verbose
+        device=self.device
+        name=self.name
+        x=self.tr_x.to(device)
+        model=model.train()
+        model=model.to(device)
+        optimizer=torch.optim.Adam(model.parameters(), lr=lr,amsgrad=True) 
+        hidden_size=self.make_hidden_list(self.features,param['depth'],param['bottleneck'])
+        param_dict={'encoder_hidden_size':hidden_size, 
+                                'cox_hidden_size':hidden_size+[1],'bn':1,'dr_p':param['drop_out'],
+                               'num_out_layers':1,
+       'cat_type':'null','lambda1':param['lambda1'],'bn_cox':1,'dr_p_cox':param['drop_out'],'noise':None}
+                        auto_surv_list.append( Autosurv(**param) ) 
+        for iteration in range(epoch):
+            t0=time.time()
+            optimizer.zero_grad()
+            x=x.to(device)
+            neg_log_partial_likelihood=coxloss(self.tr_Rlist).to(device) 
+            if name=='as':
+                x_tilt,cox_out=model(x)
+                z=neg_log_partial_likelihood(cox_out).to(device)
+                loss = lambda1*MSELoss(reduction='mean')(x_tilt,x) +z
+            if name=='fc':
+                cox_out=model(x)
+                loss =neg_log_partial_likelihood(cox_out).to(device)
+            #loss_list.append(loss.cpu().data.numpy()[0])
+            loss.backward()
+            optimizer.step() 
+            #evaluation on validation dataset
+            loss,cidx,marker=self.predict(x=self.val_x, Rlist=self.va_Rlist,\
+            model=ele,verbose=1,name=name)
+            loss_hist.append(loss.cpu().data.numpy())
+            if len(loss_hist)>4 and loss_hist[-1]>loss_high[-2] and loss_hist[-2]>loss_hist[-3]:
+                break
+        return cidx
     def save_model_out_info(self,folder):
         pass
             
@@ -324,12 +348,12 @@ def splitdata(X,t,censor,training_percent,val_percent,save,saveid):
 
 
 class LinearBlock(torch.nn.Module):
-    def __init__(self, in_channel,out_channel,bn,dr_p ,no_tail=False):
+    def __init__(self, in_channel,out_channel,bn,dr_p ,no_tail=False,bias=True):
         super(LinearBlock, self).__init__()
          
          
         mylist=ModuleList()
-        mylist.append(Linear( in_channel,out_channel))
+        mylist.append(Linear( in_channel,out_channel,bias=bias))
         if no_tail==False:
             if bn==1:
                 mylist.append(BatchNorm1d(out_channel) )
