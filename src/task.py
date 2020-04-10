@@ -19,7 +19,7 @@ import torch
 import time
 from torch.nn import Conv1d, ModuleList ,BatchNorm1d,Sequential,\
 AdaptiveAvgPool1d,Linear,MSELoss,LSTM,GRU,MaxPool1d,AdaptiveMaxPool1d,AvgPool1d
- 
+import xgboost as xgb
 #import torch.nn.SyncBatchNorm as BatchNorm1d 
 from torch.nn import  LeakyReLU,ReLU,Dropout
 
@@ -43,13 +43,18 @@ class surv_experiment():
     time_distribution=time_distribution,\
     la=la,al=al,miu=miu,cencorrate=cencorrate,sigma=sigma,random_seed=random_seed)
             print('censorsamples_rate={}'.format(self.c_rate))
-            self.train_x,self.train_y,self.train_c,\
-            self.val_x,self.val_y,self.val_c,\
-            self.test_x,self.test_y,self.test_c=self.splitdata(self.full_x,\
+            self.train_x,self.train_t,self.train_c,\
+            self.val_x,self.val_t,self.val_c,\
+            self.test_x,self.test_t,self.test_c=self.splitdata(self.full_x,\
             self.full_t,self.full_c,\
             training_percent=training_percent,val_percent=val_percent,save=save,saveid=saveid)
+            self.features=p
         else:
             self.splitcv(x,t,c,training_percent,nfolds)
+        self.seed=random_seed
+        self.maxepochs=1000
+        self.lr=0.002
+        self.verbose=2
     def generate_x(self,n,p,realp,distribution_type,random_seed ,sigma,case=0):
         '''case:0 original add extra dimension noise
            case:1 original linear transformed add extra dimension noise
@@ -178,77 +183,181 @@ class surv_experiment():
         split data into training,val,test
         '''            
                 
-    def test_model(self,name='as',param_list,train_x,train_y,train_c,val_x,val_y,val_c,\
-    epochs=1000):
-        tr_x,tr_t,tr_delta,tr_Rlist=order_make_Rlist(train_x,train_y,train_c)
-        va_x,va_t,va_delta,va_Rlist=order_make_Rlist(val_x,val_y,val_c)
-        if name in ['as','fc']:
+    def test_model(self,name='as',model,train_x,train_t,train_c,val_x,val_t,val_c,\
+    test_x,test_t,test_c,epochs=1000):
+         
+        tr_x,tr_t,tr_delta,tr_Rlist=order_make_Rlist(train_x,train_t,train_c)
+        va_x,va_t,va_delta,va_Rlist=order_make_Rlist(val_x,val_t,val_c)
+        test_x,test_t,test_delta,test_Rlist=order_make_Rlist(test_x,test_t,test_c)
+        if name in ['as','fc','xgb']:
             tpe_algo = tpe.suggest
             tpe_trials = Trials()
+            if name=='as':
+                space = [hp.quniform('encoder_depth', 1, 3,1),hp.quniform('bottleneck', 10, 30,1),\
+                hp.quniform('fc_depth',1, 3,1),\
+                         hp.loguniform('lambda1', 0.001, 10),hp.uniform('drop_out', 0.1, 0.5)]
+                self.tr_x=tr_x
+                self.tr_Rlist=tr_Rlist
+                self.va_x=va_x
+                self.va_t=va_t
+                self.va_c=va_c
+            if name=='fc':
+                self.tr_x=tr_x
+                self.tr_Rlist=tr_Rlist
+                self.va_x=va_x
+                self.va_t=va_t
+                self.va_c=va_c
+                space = [hp.quniform('encoder_depth', 1, 3,1),\
+            hp.quniform('bottleneck', 10, 30,1),hp.uniform('drop_out', 0.1, 0.5)]
+            if name=='xgb':
+                self.tr_x=tr_x.data.numpy()
+                self.tr_t=tr_t.data.numpy()
+                self.tr_c=tr_c.data.numpy()
+                self.va_x=va_x.data.numpy()
+                self.va_t=va_t.data.numpy()
+                self.va_c=va_c.data.numpy()
+                space = [hp.quniform('max_depth',1,5,1),\
+            hp.quniform('n_estimator', 10,1000,1)]
+            self.name=name
+            obj=self.training_mod
             
-            self.training_mod(tr_x=train_x,tr_Rlist=tr_Rlist,va_x=va_x,va_Rlist=va_Rlist, param=param,\
-                lr=0.002,lambda1=ele.lambda1,epoch=epochs,verbose=2,name=name)
             tpe_best = fmin(fn=obj, space=space, 
                             algo=tpe_algo, trials=tpe_trials, 
-                            max_evals=10,rstate=np.random.RandomState(4))
-            loss,cidx,marker=self.predict(x=test_x, t=test_y,delta=test_c,model=mod_list[selected_idx],verbose=1,name='auto_surv')
-            self.model_out_info[name]={'loss':loss,'cindex':cidx,'marker':marker}
-        if name in ['glmnet']:
-            pass
+                            max_evals=15,rstate=np.random.RandomState(4))
+            if name=='xgb':
+                test_x=test_x.data.numpy()
+                test_t=test_t.data.numpy()
+                test_c=test_c.data.numpy()
+            if name in ['glmnet']:
+                pass
         if name in ['xgboost']:
             pass
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        _,model=self.training_mod(**tpe_best)
+        loss,cidx,marker=self.predict(x=test_x, t=test_t,delta=test_c,\
+    model=model,name=name)
+        self.model_out_info[name]={'loss':loss,'cindex':cidx,'marker':marker,\
+                           'model':model}
+        
         return self.model_out_info
            
     def init_model_list(self):
         pass
-                
-    def bo_obj_as(self,depth,shrink,lambda1,drop_out):    
-        return self.training_mod(self,tr_x ,tr_Rlist,va_x,va_Rlist,model ,\
-                    lr=0.002,lambda1=lambda1,epoch=epochs,verbose=2,name=name,device=self.device):
-        
+                    
+    def predict(self,x, t,delta,model,verbose,name):
+        if name in ['as','fc']:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')        
+            '''
+            given x,t,delta,train a model
+            '''
+            x,t,delta,Rlist=order_make_Rlist(x,t,delta)
+              
+            model=model.eval()
+            model=model.to(device)
+             
+            t0=time.time()
+             
+            x=x.to(device)
+            if name =='as':
+                _,cox_out=model(x)
+            if name =='fc':
+                cox_out=model(x)
+            c_idx=cindex(cox_out.cpu().data.numpy(),Rlist) 
+            neg_log_partial_likelihood=coxloss(Rlist).to(device)
+            loss_val=neg_log_partial_likelihood(cox_out).cpu().data.numpy()[0]
+            
+            t1=time.time()-t0
+            if verbose==2:
+                print('eval {} takes {}s cindex={}'.format(t1,name,c_idx))
+            return loss_val,c_idx,cox_out.cpu().data.numpy()    
+        if name in ['xgb']:
+            x,t,delta,Rlist=order_make_Rlist(x,t,delta)
+            marker=gbm.predict(x).reshape(-1)
+            c_idx=cindex(marker,Rlist) 
+            return 0,c_idx,marker                  
+         
     def bo_obj_fc(self,depth,shrink,lambda1,drop_out):
-        
+        pass
+    
+    '''
+            param[0] encoder depth
+            param[1] encoder bottleneck
+            param[2] fc length
+    '''
     def training_mod(self,param ):
+        #background variabls,outside this function
+        #self.tr_x,self.tr_Rlist,self.val_x,self.val_Rlist
         lr=self.lr
         epochs=self.max_epochs
         verbose=self.verbose
         device=self.device
         name=self.name
-        x=self.tr_x.to(device)
-        model=model.train()
-        model=model.to(device)
+        
+       
         optimizer=torch.optim.Adam(model.parameters(), lr=lr,amsgrad=True) 
-        hidden_size=self.make_hidden_list(self.features,param['depth'],param['bottleneck'])
-        param_dict={'encoder_hidden_size':hidden_size, 
-                                'cox_hidden_size':hidden_size+[1],'bn':1,'dr_p':param['drop_out'],
-                               'num_out_layers':1,
-       'cat_type':'null','lambda1':param['lambda1'],'bn_cox':1,'dr_p_cox':param['drop_out'],'noise':None}
-                        auto_surv_list.append( Autosurv(**param) ) 
-        for iteration in range(epoch):
-            t0=time.time()
-            optimizer.zero_grad()
-            x=x.to(device)
-            neg_log_partial_likelihood=coxloss(self.tr_Rlist).to(device) 
+        
+        if name in ['as','fc']:
+            x=self.tr_x.to(device)
+            hidden_size=self.make_hidden_list(self.features,param[0],param[1])
             if name=='as':
-                x_tilt,cox_out=model(x)
-                z=neg_log_partial_likelihood(cox_out).to(device)
-                loss = lambda1*MSELoss(reduction='mean')(x_tilt,x) +z
+                param_dict={'encoder_hidden_size':hidden_size, \
+       'cox_hidden_size':[param[1]]*param[2]+[1],'bn':1,'dr_p':param[4],
+       'num_out_layers':1,\
+       'cat_type':'null','lambda1':param[3],'bn_cox':1,'dr_p_cox':param[4],'noise':None}
+                model=Autosurv(**param_dict) 
             if name=='fc':
-                cox_out=model(x)
-                loss =neg_log_partial_likelihood(cox_out).to(device)
-            #loss_list.append(loss.cpu().data.numpy()[0])
-            loss.backward()
-            optimizer.step() 
-            #evaluation on validation dataset
-            loss,cidx,marker=self.predict(x=self.val_x, Rlist=self.va_Rlist,\
-            model=ele,verbose=1,name=name)
-            loss_hist.append(loss.cpu().data.numpy())
-            if len(loss_hist)>4 and loss_hist[-1]>loss_high[-2] and loss_hist[-2]>loss_hist[-3]:
-                break
-        return cidx
+                param_dict={'encoder_hidden_size':hidden_size,'bn':1,'dr_p':param[2]}
+                model=Fc(**param_dict) 
+            model=model.train()
+            model=model.to(device)
+            for iteration in range(epoch):
+                t0=time.time()
+                optimizer.zero_grad()
+                #x=x.to(device)
+                neg_log_partial_likelihood=coxloss(self.tr_Rlist).to(device) 
+                if name=='as':
+                    x_tilt,cox_out=model(x)
+                    z=neg_log_partial_likelihood(cox_out).to(device)
+                    loss = param_dict['lambda1']*MSELoss(reduction='mean')(x_tilt,x) +z
+                if name=='fc':
+                    cox_out=model(x)
+                    loss =neg_log_partial_likelihood(cox_out).to(device)
+                #loss_list.append(loss.cpu().data.numpy()[0])
+                loss.backward()
+                optimizer.step() 
+                #evaluation on validation dataset
+                if self.earlystop==True:
+                    loss,cidx,marker=self.predict(x=self.va_x, t=self.va_t,delta=self.va_c,\
+                    model=model,verbose=1,name=name)
+                else:
+                    loss,cidx,marker=self.predict(x=self.tr_x, t=self.tr_t,delta=self.tr_c,\
+                    model=model,verbose=1,name=name)
+                loss_hist.append(loss.cpu().data.numpy())
+                if len(loss_hist)>4 and loss_hist[-1]>loss_high[-2] and loss_hist[-2]>loss_hist[-3]:
+                    break
+            if self.earlystop==False:
+                loss,cidx,marker=self.predict(x=self.va_x, t=self.va_t,delta=self.va_c,\
+                    model=model,verbose=1,name=name)
+            return cidx,model
+        if name in ['xgb']:
+            xgb_tr_x=self.tr_x.data.numpy() 
+             
+            xgb_tr_t=np.array( [self.tr_t.data.numpy()[idx] if self.tr_c.data.numpy()[idx]==1 \
+            else -self.tr_t.data.numpy()[idx] \
+    for idx in range(len(self.tr_t.data.numpy()))] )
+            xgb_va_x=self.tr_x.data.numpy()
+            gbm=xgb.XGBRegressor(objective='survival:cox',booster='gbtree',max_depth=params[0],\
+        n_estimators=params[1]).fit(xgb_tr_x,xgb_tr_t)
+            loss,cidx,marker=self.predict(x=xgb_va_x.data.numpy(), t=self.va_t.data.numpy(),delta=self.va_c.data.numpy(),\
+                model=gbm,verbose=1,name=name)
+        return cidx,model   
     def save_model_out_info(self,folder):
         pass
-            
+    def make_hidden_list(self,in_size,depth,bottleneck_size):
+        step= ( np.log(bottleneck_size)-np.log(in_size) )/depth
+        return list( np.exp( np.arange(np.log(in_size),np.log(bottleneck_size)+0.1*step,step) ).astype(int))
+                 
 def generate_x(n,p,realp,distribution_type,random_seed ,sigma):
     generate_model=Fc( encoder_hidden_size=[realp,int(np.sqrt(p)),p], bn=0,dr_p=0)
     X=np.random.uniform(0,1,n*realp).reshape((n,realp)).astype(np.float32,casting='same_kind')
@@ -566,7 +675,7 @@ def predict(x, t,delta,model,verbose,name):
     t0=time.time()
      
     x=x.to(device)
-    if name =='auto_surv':
+    if name =='as':
         _,cox_out=model(x)
     if name =='fc':
         cox_out=model(x)
@@ -623,7 +732,7 @@ def comparemodel(case=1,features=20,realp=10,samples_n=100,saveid=1):
         x,y,t,rate=simulatedata(samples_n,features,realp=realp,cencorrate=0.5,random_seed=saveid,sigma=1)
         print('{} censored samples'.format(rate))
         train_x,train_y,train_c,val_x,val_y,val_c,\
-        test_x,test_y,test_c=splitdata(x,y,t,0.6,0.2,save=True,saveid=saveid)
+        test_x,test_y,test_c=splitdata(x,y,t,0.6,0.2,save=False,saveid=saveid)
         auto_surv_list=[]
         fc_list=[]
         as_record=[]
