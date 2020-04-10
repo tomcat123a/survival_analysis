@@ -22,7 +22,7 @@ AdaptiveAvgPool1d,Linear,MSELoss,LSTM,GRU,MaxPool1d,AdaptiveMaxPool1d,AvgPool1d
 import xgboost as xgb
 #import torch.nn.SyncBatchNorm as BatchNorm1d 
 from torch.nn import  LeakyReLU,ReLU,Dropout
-
+from hyperopt import hp,tpe,Trials,fmin 
 import argparse
 Parser=argparse.ArgumentParser()
 
@@ -34,10 +34,10 @@ parser=Parser.parse_args()
 a=surv_experiment()
 
 class surv_experiment():
-    def __init__(self,simu=True,cancer='BRCA',n=100,p=10,realp=30,distribution_type='gaussian',\
-                 time_distribution='weibull',\
+    def __init__(self,simu=True,cancer='BRCA',n=100,p=1000,realp=20,distribution_type='gaussian',\
+                 time_distribution='weibull',epochs=1000,\
                  la=0.8,al=1,miu=2,cencorrate=0.5,sigma=0.2,random_seed=0,\
-                 training_percent=0.6,val_percent=0.2,save=False,saveid=1):
+                 training_percent=0.6,val_percent=0.2,es=True,save=True,saveid=1):
         if simu==True:
             self.full_x,self.full_t,self.full_c,self.c_rate=self.simulatedata(n=n,p=p,realp=realp,distribution_type=distribution_type,\
     time_distribution=time_distribution,\
@@ -49,12 +49,32 @@ class surv_experiment():
             self.full_t,self.full_c,\
             training_percent=training_percent,val_percent=val_percent,save=save,saveid=saveid)
             self.features=p
+            self.realp=realp
         else:
-            self.splitcv(x,t,c,training_percent,nfolds)
+            x=pd.read_csv('{}_x.csv'.format(cancer))
+            t=pd.read_csv('{}_t.csv'.format(cancer))
+            c=pd.read_csv('{}_c.csv'.format(cancer))
+            self.splitdata(x,\
+            t,c,\
+            training_percent=training_percent,val_percent=val_percent,save=save,saveid=saveid)
         self.seed=random_seed
-        self.maxepochs=1000
+        self.maxepochs=epochs
         self.lr=0.002
         self.verbose=2
+        self.noise=sigma
+        self.saveid=saveid
+        self.model_out_info={}
+        self.earlystop=es
+        self.test_model(name='as',self.train_x,self.train_t,self.train_c,self.val_x,\
+                        self.val_t,self.val_c,\
+    self.test_x,self.test_t,self.test_c)
+        self.test_model(name='fc',self.train_x,self.train_t,self.train_c,self.val_x,\
+                        self.val_t,self.val_c,\
+    self.test_x,self.test_t,self.test_c)
+        self.test_model(name='xgb',self.train_x,self.train_t,self.train_c,self.val_x,\
+                        self.val_t,self.val_c,\
+    self.test_x,self.test_t,self.test_c)
+        
     def generate_x(self,n,p,realp,distribution_type,random_seed ,sigma,case=0):
         '''case:0 original add extra dimension noise
            case:1 original linear transformed add extra dimension noise
@@ -183,8 +203,8 @@ class surv_experiment():
         split data into training,val,test
         '''            
                 
-    def test_model(self,name='as',model,train_x,train_t,train_c,val_x,val_t,val_c,\
-    test_x,test_t,test_c,epochs=1000):
+    def test_model(self,name='as',train_x,train_t,train_c,val_x,val_t,val_c,\
+    test_x,test_t,test_c):
          
         tr_x,tr_t,tr_delta,tr_Rlist=order_make_Rlist(train_x,train_t,train_c)
         va_x,va_t,va_delta,va_Rlist=order_make_Rlist(val_x,val_t,val_c)
@@ -193,7 +213,7 @@ class surv_experiment():
             tpe_algo = tpe.suggest
             tpe_trials = Trials()
             if name=='as':
-                space = [hp.quniform('encoder_depth', 1, 3,1),hp.quniform('bottleneck', 10, 30,1),\
+                space = [hp.quniform('encoder_depth', 1, 4,1),hp.quniform('bottleneck', 10, 30,1),\
                 hp.quniform('fc_depth',1, 3,1),\
                          hp.loguniform('lambda1', 0.001, 10),hp.uniform('drop_out', 0.1, 0.5)]
                 self.tr_x=tr_x
@@ -207,7 +227,7 @@ class surv_experiment():
                 self.va_x=va_x
                 self.va_t=va_t
                 self.va_c=va_c
-                space = [hp.quniform('encoder_depth', 1, 3,1),\
+                space = [hp.quniform('encoder_depth', 1, 4,1),\
             hp.quniform('bottleneck', 10, 30,1),hp.uniform('drop_out', 0.1, 0.5)]
             if name=='xgb':
                 self.tr_x=tr_x.data.numpy()
@@ -224,26 +244,29 @@ class surv_experiment():
             tpe_best = fmin(fn=obj, space=space, 
                             algo=tpe_algo, trials=tpe_trials, 
                             max_evals=15,rstate=np.random.RandomState(4))
+            print('id_{}_d_{}_rd_{}_noi{}_sam_{}_es_{}'.format(self.saveid,\
+    self.features,self.realp,self.noise,self.n,int(self.earlystop)))
+            print(name)
+            print(tpebest)
             if name=='xgb':
                 test_x=test_x.data.numpy()
                 test_t=test_t.data.numpy()
                 test_c=test_c.data.numpy()
             if name in ['glmnet']:
                 pass
-        if name in ['xgboost']:
-            pass
+         
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
-        _,model=self.training_mod(**tpe_best)
+        _,model=self.training_mod(list(tpe_best.values()))
         loss,cidx,marker=self.predict(x=test_x, t=test_t,delta=test_c,\
     model=model,name=name)
         self.model_out_info[name]={'loss':loss,'cindex':cidx,'marker':marker,\
                            'model':model}
         
-        return self.model_out_info
+        return self.model_out_info,model,tpe_best
            
-    def init_model_list(self):
-        pass
+    
+        
                     
     def predict(self,x, t,delta,model,verbose,name):
         if name in ['as','fc']:
@@ -352,8 +375,19 @@ class surv_experiment():
             loss,cidx,marker=self.predict(x=xgb_va_x.data.numpy(), t=self.va_t.data.numpy(),delta=self.va_c.data.numpy(),\
                 model=gbm,verbose=1,name=name)
         return cidx,model   
-    def save_model_out_info(self,folder):
-        pass
+    def save_model_out_info(self,info_list):
+        cidx_result=pd.DataFrame()
+        for name in self.model_out_info.keys:
+            cidx_result[name]=self.model_out_info[name]['cindex']
+        cidx_result.to_csv('id_{}_d_{}_rd_{}_noi{}_sam_{}_es_{}cidx.csv'.format(self.saveid,\
+    self.features,self.realp,self.noise,self.n,int(self.earlystop)),index=False)
+        p=pd.DataFrame()
+        for name in self.model_out_info.keys:
+            p[name]=self.model_out_info[name]['marker']
+        p.to_csv('../simulationdata/id_{}_d_{}_rd_{}_noi{}_sam_{}_es_{}marker.csv'.\
+    format(self.saveid,\
+    self.features,self.realp,self.noise,self.n,int(self.earlystop)),index=False)
+ 
     def make_hidden_list(self,in_size,depth,bottleneck_size):
         step= ( np.log(bottleneck_size)-np.log(in_size) )/depth
         return list( np.exp( np.arange(np.log(in_size),np.log(bottleneck_size)+0.1*step,step) ).astype(int))
